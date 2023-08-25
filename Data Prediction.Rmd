@@ -1,0 +1,344 @@
+---
+title: "Data Prediction"
+author: "haoran"
+date: "2022/12/3"
+output: pdf_document
+---
+
+```{r}
+library(randomForest)
+library(gbm)
+library(nnet)
+library(glmnet)
+```
+
+
+```{r}
+data = read.csv("Data2020.csv", header = TRUE)
+#head(data)
+Data2020testX = read.csv("Data2020testX.csv")
+set.seed(301387487) #Data Splitting 
+
+n = nrow(Data)
+R = 3
+V = 5
+```
+
+helper function: rescale for Neural Networks
+```{r}
+rescale <- function(x1,x2){
+  for(col in 1:ncol(x1)){
+    a <- min(x2[,col])
+    b <- max(x2[,col])
+    x1[,col] <- (x1[,col]-a)/(b-a)
+  }
+  x1
+}
+```
+
+helper function: MSPE
+```{r}
+get.MSPE=function(Y,Y.hat){
+  return(mean((Y-Y.hat)^2))
+}
+```
+
+**Random Forest**
+```{r}
+# Make categorical data to factor
+Data1 = Data
+Data1$X4 = as.factor(Data1$X4)
+Data1$X10 = as.factor(Data1$X10)
+```
+
+```{r}
+# tune m using 1, p/3, 2p/3, p
+numV = c(1, 5, 10, 15) # mtry
+nodez = c(3, 5, 10) # nodesize
+parms = expand.grid(numV, nodez)
+MSPE.rf = matrix(NA, nrow = V*R, ncol = length(numV)*length(nodez))
+MSE.rf = matrix(NA, nrow = V*R, ncol = length(numV)*length(nodez))
+colnames(MSPE.rf) = paste(parms[,1], parms[,2], sep="|")
+colnames(MSE.rf) = paste(parms[,1], parms[,2], sep="|")
+```
+
+```{r}
+for (r in 1:R){
+  folds = floor((sample.int(n)-1)*V/n) + 1
+  for(v in 1:V){
+    train = Data1[folds!=v,]
+    train.y = train$Y
+    qq=1
+    for(d in numV){
+    for(s in nodez){
+        mod.rf = randomForest(data=train, Y ~.,
+                       importance=TRUE, ntree=1000, mtry=d, nodesize = s, keep.forest=TRUE)
+        MSPE.rf[(r-1)*V+v,qq] = get.MSPE(train.y,predict(mod.rf))
+        MSE.rf[(r-1)*V+v,qq] = mean((train.y - predict(mod.rf, newdata = train))^2)
+        qq = qq+1
+      }
+  }
+  }
+}
+```
+
+```{r}
+saveRDS(MSPE.rf, "MSPE.rf.452.rds")
+mean.rf = apply(MSPE.rf, 2, mean)
+which.min(mean.rf) # 1|5 5
+best.rf = MSPE.rf[,5]
+```
+
+**Boosting**
+```{r}
+shr = c(.001,.005,.025,.125)
+dep = c(2,4,6)
+trees = 10000
+parms = expand.grid(dep, shr)
+MSPE.boost = matrix(NA, nrow=V*R, ncol = length(shr)*length(dep))
+MSE.boost = matrix(NA, nrow=V*R, ncol = length(shr)*length(dep))
+opt.tree = matrix(NA, nrow=V*R, ncol= length(shr)*length(dep))
+colnames(MSE.boost) = paste(parms[,1], parms[,2], sep = "|")
+colnames(MSPE.boost) = paste(parms[,1], parms[,2], sep = "|")
+```
+
+
+```{r}
+for(r in 1:R){
+  folds = floor((sample.int(n)-1)*V/n) + 1
+  for(v in 1:V){
+    train = Data1[folds!=v,]
+    test = Data1[folds==v,]
+    qq=1
+    for(d in dep){
+      for(s in shr){
+        mod.gbm <- gbm(data=train, Y~., distribution="gaussian",
+                       n.trees=trees, interaction.depth=d, shrinkage=s,
+                       bag.fraction=0.8)
+        treenum = min(trees, 2*gbm.perf(mod.gbm, method="OOB", plot.it=FALSE))
+        opt.tree[(r-1)*V+v,qq] = treenum
+        preds = predict(mod.gbm, newdata=test, n.trees=treenum)
+        MSPE.boost[(r-1)*V+v,qq] = get.MSPE(preds,test$Y)
+        pred_b_train = predict(mod.gbm, newdata = train, n.trees=treenum)
+        MSE.boost[(r-1)*V+v,qq] = mean((train$Y - pred_b_train)^2)
+        qq = qq+1
+      }
+    }
+  }
+}
+(mean.tree = apply(opt.tree, 1, mean))
+```
+
+```{r}
+saveRDS(MSPE.boost, "MSPE.boost.452.rds")
+mean.tree = apply(opt.tree, 2, mean)
+mean.boost = apply(MSPE.boost, 2, mean)
+which.min(mean.boost) # 4|0.125 11
+best.boost = MSPE.boost[,11]
+```
+
+**Neural Net**
+```{r}
+Data2 = Data
+set.seed(39021039)
+n = nrow(Data)
+nrounds=20 # Number of nnets per setting.  May or may not be enough!
+
+siz <- c(1, 3, 5, 8, 12)
+dec <- c(0, 0.001, 0.1, 0.5, 1)
+parms = expand.grid(dec,siz)
+# Set up matrices to hold results. First two columns are parameter values.
+#  Each column after that is a rep.
+MSPE.NN <- matrix(NA, nrow=V*R, ncol=length(siz)*length(dec))
+MSE.NN <- matrix(NA, nrow=V*R, ncol=length(siz)*length(dec))
+colnames(MSPE.NN) = paste(parms[,1], parms[,2], sep = "|")
+colnames(MSE.NN) = paste(parms[,1], parms[,2], sep = "|")
+```
+
+```{r}
+for (r in 1:R){
+  folds = floor((sample.int(n)-1)*V/n) + 1
+  for(v in 1:V){
+
+    y.1 <- as.matrix(Data1[folds!=v, "Y"])
+    x.1.unscaled <- as.matrix(Data2[folds!=v,-1])
+    x.1 <- rescale(x.1.unscaled, x.1.unscaled)
+
+    #Test
+    y.2 <- as.matrix(Data2[folds==v, "Y"])
+    x.2.unscaled <- as.matrix(Data2[folds==v,-1]) # Original data set 2
+    x.2 = rescale(x.2.unscaled, x.1.unscaled)
+
+  #Start counter to add each model's MSPE to row of matrix
+    qq=1
+  #Start Analysis Loop for all combos of size and decay on chosen data set
+    for(d in dec){
+      for(s in siz){
+
+        ## Restart nnet nrounds times to get best fit for each set of parameters
+        MSE.final <- 9e99
+        #  check <- MSE.final
+        for(i in 1:nrounds){
+          nn <- nnet(y=y.1, x=x.1, linout=TRUE, size=s, decay=d, maxit=500, trace=FALSE)
+          MSE <- nn$value/nrow(x.1)
+          if(MSE < MSE.final){
+            MSE.final <- MSE
+            nn.final <- nn
+          }
+        }
+        pred.nn = predict(nn.final, newdata=x.2)
+        MSPE.NN[(r-1)*V+v,qq] = get.MSPE(y.2,pred.nn)
+        MSE.NN[(r-1)*V+v,qq] <- MSE.final
+        qq = qq+1
+      }
+    }
+  }
+}
+```
+
+```{r}
+mean.NN = apply(MSPE.NN, 2, mean)
+which.min(mean.NN) # 0.5|12 24
+best.NN = MSPE.NN[,24]
+```
+
+**LASSO**
+```{r}
+Data3 = Data
+MSPE.lasso = matrix(NA, nrow = V*R, ncol = 2)
+colnames(MSPE.lasso) = c("relaxed/min", "relaxed/+1SE")
+```
+
+```{r}
+for(r in 1:R){
+  set.seed(29003092)
+  # reindex each row number in the training data set
+  folds = floor((sample.int(n)-1)*V/n) + 1
+
+  for (v in 1:V) {
+    # model: relaxed LASSO/min
+    mod.relaxed = cv.glmnet(y = Data3[folds != v, "Y"],
+                             x = as.matrix(Data3[folds != v, -1]),
+                             family = "gaussian", relax = TRUE)
+
+    # Prediction for LASSO
+    ## Prediction for relaxed-LASSO/min
+    pred.relax.min <- predict(mod.relaxed, newx=as.matrix(Data3[folds == v, -1]),
+                                    s="lambda.min", gamma="gamma.min")
+    MSPE.lasso[(r-1)*V+v,1] <- mean((Data3[folds == v, "Y"] - pred.relax.min)^2)
+
+    ## Prediction for relaxed-LASSO/+1SE
+    pred.relax.se <- predict(mod.relaxed, newx=as.matrix(Data3[folds == v, -1]),
+                                    s="lambda.1se", gamma="gamma.1se")
+    MSPE.lasso[(r-1)*V+v,2] <- mean((Data3[folds == v, "Y"] - pred.relax.se)^2)
+  }
+}
+
+```
+
+```{r}
+saveRDS(MSPE.lasso, "MSPE.lasso.452.rds")
+mean.lasso = apply(MSPE.lasso, 2, mean)
+which.min(MSPE.lasso)  # relaxed/min
+```
+```{r}
+R = 10
+K=5
+all.models = ("PLS")
+pls.MSPEs  = array(0, dim = c(K*R, length(all.models)))
+colnames(pls.MSPEs ) = all.models
+pls.MSPEs 
+
+for(j in 1:R){
+  
+
+
+  for(i in 1:K){
+  
+  data.train = data[folds != i,]
+  data.valid = data[folds == i,]
+  n.train = nrow(data.train) 
+  Y.valid = data.valid$Y
+  
+  # PLS
+  fit.pls = plsr(Y ~ ., data = data.train, validation = "CV", segments = 5)  # segments is number of folds
+  CV.pls = fit.pls$validation # All the CV information
+  PRESS.pls = CV.pls$PRESS    # Sum of squared CV residuals
+  CV.MSPE.pls = PRESS.pls / nrow(data.train)  # MSPE for internal CV
+  ind.best.pls = which.min(CV.MSPE.pls) # Optimal number of components
+  
+  pred.pls = predict(fit.pls, data.valid, ncomp = ind.best.pls)
+  MSPE.pls = get.MSPE(Y.valid, pred.pls)
+  pls.MSPEs[(j-1)*K+i, "PLS"] = MSPE.pls
+  }
+}
+pls.MSPEs 
+```
+
+```{r}
+best.pls=boxplot(pls.MSPEs,xlab="best.pls", main="Relative square MSPE")
+
+### Calculate RMSPEs
+all.RMSPEs = apply(pls.MSPEs, 1, function(W){
+  best = min(W)
+  return(W / best)
+})
+
+all.RMSPEs = t(all.RMSPEs)
+
+### Make a boxplot of RMSPEs
+boxplot(all.RMSPEs)
+
+boxplot(all.RMSPEs, ylim = c(1, 1.2) ,main = paste0("CV RMSPEs over ", K, " folds and ",R," replicates"))
+```
+
+
+
+```{r}
+MSPE.pro = cbind(MSPE.lasso, best.rf, best.boost, best.NN )
+boxplot(sqrt(MSPE.pro), las=2,
+        main=" square root of MSPE")
+
+# relative root MSPE Boxplot
+low = apply(MSPE.pro, 1, min)
+par(mfrow=c(1,2))
+boxplot(sqrt(MSPE.pro/low), las=2,
+        main="Relative square MSPE")
+boxplot(pls.MSPEs,xlab="best.pls", main="Relative square MSPE")
+
+```
+Choose the final model and apply the test data get the predicted value 
+```{r}
+tuned.boosting = gbm(data=train, Y~., distribution="gaussian",
+                       n.trees=trees, interaction.depth=4, shrinkage=0.125,
+                       bag.fraction=0.8)
+prediction = predict(tuned.boosting, newdata = Data2020testX)
+write.table(prediction,"submit.csv",sep=",",row.names = F,col.names = F)
+```
+
+```{r}
+fit.gbm.best = gbm(Y ~ ., data = data.train, distribution = "gaussian", n.trees = 100,interaction.depth = 7, shrinkage = 0.04, bag.fraction = 0.8)
+prediction = predict(fit.gbm.best, newdata = Data2020testX)
+write.table(prediction,"c.csv",sep=",",row.names = F,col.names = F)
+```
+
+```{r}
+tuned.boosting = gbm(data=train, Y~., distribution="gaussian",
+                       n.trees=500, interaction.depth=4, shrinkage=0.125,
+                       bag.fraction=0.8)
+prediction = predict(tuned.boosting, newdata = Data2020testX)
+write.table(prediction,"project2.csv",sep=",",row.names = F,col.names = F)
+```
+
+
+Check the gap between MSE and MSPE in NN, boosting and random forest
+```{r}
+gap1.rf=mean(MSPE.rf-MSE.rf)
+gap1.rf
+gap2.boost=mean(MSPE.boost-MSE.boost)
+gap2.boost
+gap3.NN=mean(MSPE.NN-MSE.NN)
+gap3.NN
+
+```
+
